@@ -1,0 +1,137 @@
+resources:
+  - name: jcs_bitbucket
+    type: GitRepo
+    configuration:
+      path: store/jcs
+      gitProvider: JFrog_bitbucket
+      branches:
+        include: ^{{gitBranch}}$
+
+  - name: jcs_maven_build_info
+    type: BuildInfo
+    configuration:
+      sourceArtifactory: entplus_deployer
+      buildName: ba_services_jcs
+      buildNumber: ${run_number}
+
+  - name: jcs_docker_build_info
+    type: BuildInfo
+    configuration:
+      sourceArtifactory: entplus_deployer
+      buildName: ba_services_jcs
+      buildNumber: ${run_number}
+
+  - name: jcs_jfrog_io_docker_image
+    type: Image
+    configuration:
+      registry: art_jfrog_io
+      sourceRepository: art-docker-dev-local
+      imageName: art.jfrog.io/jfrog/ba/services/jcs
+      imageTag: ${VERSION}
+
+pipelines:
+  - name: jcs_docker
+    steps:
+      - name: prepare
+        type: Bash
+        configuration:
+          inputResources:
+            - name: jcs_bitbucket
+              trigger: true
+        execution:
+          onExecute:
+            - add_run_variables VERSION=$(date +"%Y.%-m").$run_number$([ "{{gitBranch}}" = "master" ] && echo "" || echo "-{{gitBranch}}")
+            - echo "VERSION '${VERSION}'"
+
+      - name: mvn_build
+        type: MvnBuild
+        configuration:
+          mvnCommand: clean install sonar:sonar --batch-mode --no-transfer-progress -Ditest.db.address=172.17.0.1:5432 -Ditest.access.url=http://172.17.0.1:8340/paymentaccess/
+          deployerSnapshotRepo: ba-services-maven-virtual
+          deployerReleaseRepo: ba-services-maven-virtual
+          resolverSnapshotRepo: ba-services-maven-virtual
+          resolverReleaseRepo: ba-services-maven-virtual
+          autoPublishBuildInfo: true
+          inputSteps:
+            - name: prepare
+          inputResources:
+            - name: jcs_bitbucket
+          integrations:
+            - name: entplus_deployer
+            - name: docker_jfrog_io_reader
+          outputResources:
+            - name: jcs_maven_build_info
+          runtime:
+            type: image
+            image:
+              auto:
+                language: java
+                versions:
+                  - 11
+        execution:
+          onStart:
+            - echo "VERSION '${VERSION}'"
+            - sed -i "s/^app\\.version=.\\+/app.version=${VERSION}/" $res_jcs_bitbucket_resourcePath/src/main/resources/version.properties
+            - cat $res_jcs_bitbucket_resourcePath/src/main/resources/version.properties
+            - docker-compose -f $res_jcs_bitbucket_resourcePath/docker-compose-itest.yml up --no-color --detach
+          onSuccess:
+            - add_run_files $res_jcs_bitbucket_resourcePath/target/jcs-0.0.1-SNAPSHOT.jar jar
+          onComplete:
+            - save_tests $res_jcs_bitbucket_resourcePath/target/test-results/surefire/
+            - docker-compose -f $res_jcs_bitbucket_resourcePath/docker-compose-itest.yml down --volumes
+
+      - name: docker_build
+        type: DockerBuild
+        configuration:
+          affinityGroup: dbp_group
+          dockerFileLocation: .
+          dockerFileName: Dockerfile
+          dockerImageName: art.jfrog.io/jfrog/ba/services/jcs
+          dockerImageTag: ${VERSION}
+          dockerOptions: --build-arg JAR_LOCATION=./
+          inputResources:
+            - name: jcs_bitbucket
+            - name: jcs_maven_build_info
+          integrations:
+            - name: entplus_jfrog_io_docker
+            - name: entplus_deployer
+          environmentVariables:
+            build_number:
+              default: $res_jcs_maven_build_info_buildNumber
+        execution:
+          onStart:
+            - cd $res_jcs_bitbucket_resourcePath
+            - restore_run_files jar jcs-0.0.1-SNAPSHOT.jar
+
+      - name: docker_push
+        type: DockerPush
+        configuration:
+          forceXrayScan: true
+          autoPublishBuildInfo: true
+          affinityGroup: dbp_group
+          targetRepository: art-docker-dev-local
+          integrations:
+            - name: entplus_jfrog_io_docker
+            - name: entplus_deployer
+            - name: ba_bitbucket_ssh_token
+          inputSteps:
+            - name: docker_build
+          inputResources:
+            - name: jcs_bitbucket
+          outputResources:
+            - name: jcs_jfrog_io_docker_image
+            - name: jcs_docker_build_info
+        execution:
+          onStart:
+            - |
+              if [ "{{gitBranch}}" = "master" ]; then
+                echo "Branch is 'master', creating Git tag '${VERSION}'"
+                pushd ${res_jcs_bitbucket_resourcePath}
+                git config core.sshCommand "ssh -i ~/.ssh/ba_bitbucket_ssh_token -F /dev/null"
+                git remote set-url origin ssh://git@git.jfrog.info/store/jcs.git
+                git tag ${VERSION}
+                ssh-keyscan -H git.jfrog.info >> /root/.ssh/known_hosts
+                git push origin ${VERSION}
+              else
+                echo "Branch is '{{gitBranch}}' (not 'master'), not creating Git tag"
+              fi
